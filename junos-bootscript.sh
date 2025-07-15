@@ -14,9 +14,9 @@
 HOSTNAME="{hostname}"
 REMOTE_SERVER="{tftp_server}" 
 CONFIG_PATH="/var/tmp/"
-FIRMWARE_PATH="/var/tmp/"
-
-CONFIG_FILE="$HOSTNAME.cfg" 
+FIRMWARE_PATH="/var/tmp/" # Relates to the URL path used in the request system add command /ex4300
+MAX_RETRIES=3
+CONFIG_FILE="$HOSTNAME.cfg"
 LOG_FILE="/var/log/ztp-upgrade.log"
 TARGET_FIRMWARE_FILE="{target_version}"
 FIRMWARE_PATH=""
@@ -55,18 +55,19 @@ log_message() {
     LOG_ENTRY=""
 
     case "$LEVEL" in
-        "DEBUG")   LOG_ENTRY="DEBUG   | $TIMESTAMP | $MESSAGE" ;; # Detailed debug information
-        "INFO")    LOG_ENTRY="INFO    | $TIMESTAMP | $MESSAGE" ;; # Normal execution messages
-        "NOTICE")  LOG_ENTRY="NOTICE  | $TIMESTAMP | $MESSAGE" ;; # Important normal conditions
-        "WARNING") LOG_ENTRY="WARNING | $TIMESTAMP | $MESSAGE" ;; # Warning conditions
-        "ERROR")   LOG_ENTRY="ERROR   | $TIMESTAMP | $MESSAGE" ;; # Error conditions
-        "COMMAND") LOG_ENTRY="COMMAND | $TIMESTAMP | $MESSAGE" ;; # CLI commands being executed
-        "RESULT")  LOG_ENTRY="RESULT  | $TIMESTAMP | $MESSAGE" ;; # Command output/results
-        *)         LOG_ENTRY="INFO    | $TIMESTAMP | $MESSAGE" ;; # Default to INFO
+        "DEBUG")   LOG_ENTRY="DEBUG   | $TIMESTAMP | $MESSAGE";;  # Detailed debug information
+        "INFO")    LOG_ENTRY="INFO    | $TIMESTAMP | $MESSAGE";; # Normal execution messages
+        "NOTICE")  LOG_ENTRY="NOTICE  | $TIMESTAMP | $MESSAGE";; # Important normal conditions
+        "WARNING") LOG_ENTRY="WARNING | $TIMESTAMP | $MESSAGE";; # Warning conditions
+        "ERROR")   LOG_ENTRY="ERROR   | $TIMESTAMP | $MESSAGE";; # Error conditions
+        "COMMAND") LOG_ENTRY="COMMAND | $TIMESTAMP | $MESSAGE";; # CLI commands being executed
+        "RESULT")  LOG_ENTRY="RESULT  | $TIMESTAMP | $MESSAGE";; # Command output/results
+        *)         LOG_ENTRY="INFO    | $TIMESTAMP | $MESSAGE";; # Default to INFO
     esac
 
     # print to console
-    echo "$LOG_ENTRY"
+    echo "$LOG_ENTRY" > /dev/console
+    logger -t ztp_bootscript "LOG_ENTRY" 
 
     # append to log file
     echo "$LOG_ENTRY" >> "$LOG_FILE" 
@@ -76,70 +77,80 @@ log_message() {
 # FIRMWARE CHECKS
 # Version comparison function
 check_version() {
-    log_message "INFO" "Starting version check"
+    local retry_count=0
+    local success=false
 
-    # Get model and version
-    log_message "DEBUG" "Getting device model"
-    log_message "COMMAND" "show version | grep Model: | trim 7"
-    MODEL=$(cli_execute "show version | grep Model: | trim 7")
-    log_message "RESULT" "Model: $MODEL"
-    log_message "INFO" "Setting firmware file path"
-    set_firmware_path $MODEL
+    while [ $retry_count -lt $MAX_RETRIES ] && [ "$success" = false ]; do
+        log_message "INFO" "Starting version check (Attempt $((retry_count + 1)) of $MAX_RETRIES)"
+        
+        # Try to get model and version
+        if MODEL=$(cli_execute "show version | grep Model: | trim 7"); then
+            log_message "RESULT" "Model: $MODEL"
+            log_message "INFO" "Setting firmware file path"
+            set_firmware_path "$MODEL"
 
-    log_message "DEBUG" "Getting current version"
-    log_message "COMMAND" "show version" | grep "Junos:" | grep -o "[0-9]\+\.[0-9]R[0-9]-S[0-9]"
-    CURRENT_VERSION=$(cli_execute "show version | grep Junos:" | sed 's/.*Junos: //' | sed 's/[a-zA-Z].*//')
+            if CURRENT_VERSION=$(cli_execute "show version | grep Junos:" | sed 's/.*Junos: //' | sed 's/[a-zA-Z].*//')
+            then
+                log_message "RESULT" "Version: $CURRENT_VERSION"
 
-    log_message "RESULT" "Version: $CURRENT_VERSION"
+                # Validate version information
+                if [ -n "$CURRENT_VERSION" ] && [ -n "$TARGET_VERSION" ]; then
+                    # Determine upgrade command based on model
+                    case "$MODEL" in
+                        *"ptx"*|*"jnp"*|*"mx304"*)
+                            UPGRADE_CMD="request vmhost software add"
+                            ;;
+                        *"qfx5110"*|*"qfx5120"*)
+                            UPGRADE_CMD="request system software add"
+                            FORCE_HOST="force-host"
+                            SKIP_VALIDATION=true
+                            ;;
+                        *"qfx5200"*|*"qfx5220"*)
+                            UPGRADE_CMD="request system software add"
+                            FORCE_HOST="force-host"
+                            ;;
+                        *"ex4300"*)
+                            UPGRADE_CMD="request system software add"
+                            SKIP_VALIDATION="no-validate"
+                            ;;
+                        *"ex4600"*)
+                            UPGRADE_CMD="request system software add"
+                            ;;
+                        *"srx4100"*|*"srx1500"*)
+                            UPGRADE_CMD="request system software add"
+                            ;;
+                        *"ex"*|*"src"*|*"mx"*)
+                            UPGRADE_CMD="request system software add"
+                            ;;
+                        *)
+                            log_message "WARNING" "Unknown model $MODEL, using default upgrade command"
+                            UPGRADE_CMD="request system software add"
+                            ;;
+                    esac
 
-    log_message "DEBUG" "Validating CURRENT_VERSION and TARGET_VERSION existence"
-    # Validate version information
-    if [ -z "$CURRENT_VERSION" ] || [ -z "$TARGET_VERSION" ]; then
-        handle_error "Invalid version information"
+                    log_message "INFO" "Current version: $CURRENT_VERSION, Target version: $TARGET_VERSION"
+                    log_message "INFO" "Platform model: $MODEL, Using upgrade command: $UPGRADE_CMD"
+                    success=true
+                    break
+                fi
+            fi
+        fi
+
+        retry_count=$((retry_count + 1))
+        if [ $retry_count -lt $MAX_RETRIES ]; then
+            log_message "WARNING" "Version check failed, retrying in 10 seconds..."
+            sleep 10
+        else
+            log_message "ERROR" "Version check failed after $MAX_RETRIES attempts"
+            handle_error "Version check failed"
+        fi
+    done
+
+    if [ "$success" = false ]; then
+        handle_error "Failed to complete version check after $MAX_RETRIES attempts"
     fi
-
-    #log_message "DEBUG" "Validating TARGET_VERSION format"
-    # May not be needed
-    #if ! echo "$TARGET_VERSION" | grep -q "[0-9]\+\.[0-9]\+[A-Z][0-9]\+-[A-Z][0-9]\+[\.]*[0-9]*"; then
-    #    handle_error "Invalid target version format: $TARGET_VERSION"
-    #fi
-
-    # Determine upgrade command based on model
-    case "$MODEL" in
-        *"ptx"*|*"jnp"*|*"mx304"*)
-            UPGRADE_CMD="request vmhost software add"
-            ;;
-        *"qfx5110"*|*"qfx5120"*)
-            UPGRADE_CMD="request system software add"
-            FORCE_HOST="force-host"
-            SKIP_VALIDATION=true
-            ;;
-        *"qfx5200"*|*"qfx5220"*)
-            UPGRADE_CMD="request system software add"
-            FORCE_HOST="force-host"
-            ;;
-        *"ex4300"*)
-            UPGRADE_CMD="request system software add"
-            SKIP_VALIDATION="no-validate"
-            ;;
-        *"ex4600"*)
-            UPGRADE_CMD="request system software add"
-            ;;
-        *"srx4100"*|*"srx1500"*)
-            UPGRADE_CMD="request system software add"
-            ;;
-        *"ex"*|*"src"*|*"mx"*)
-            UPGRADE_CMD="request system software add"
-            ;;
-        *)
-            log_message "WARNING" "Unknown model $MODEL, using default upgrade command"
-            UPGRADE_CMD="request system software add"
-            ;;
-    esac
-
-    log_message "INFO" "Current version: $CURRENT_VERSION, Target version: $TARGET_VERSION"
-    log_message "INFO" "Platform model: $MODEL, Using upgrade command: $UPGRADE_CMD"
 }
+
 
 set_firmware_path() {
     local _MODEL="$1"
@@ -163,7 +174,7 @@ set_firmware_path() {
             FIRMWARE_PATH="srx4100"
             ;;        
     esac
-    if [$FIRMWARE_PATH -z]; then
+    if [ -z "$FIRMWARE_PATH" ]; then
     log_message "INFO" "Firmware path unset...continue"
     fi
 }
@@ -180,42 +191,42 @@ validate_version() {
 
 
 # Firmware verification function
-verify_firmware() {
-    if [ "$TEST_MODE" = true ]; then
-        log_message "NOTICE" "Test Mode: Verifying firmware"
-        log_message "INFO" "Would verify firmware: $FIRMWARE_FILE"
-        return 0
-    fi
+# verify_firmware() {
+#     if [ "$TEST_MODE" = true ]; then
+#         log_message "NOTICE" "Test Mode: Verifying firmware"
+#         log_message "INFO" "Would verify firmware: $FIRMWARE_FILE"
+#         return 0
+#     fi
 
-    if [ ! -f $FIRMWARE_FILE ]; then
-        handle_error "Firmware file not found"
-    fi
+#     if [ ! -f $FIRMWARE_FILE ]; then
+#         handle_error "Firmware file not found"
+#     fi
 
-    case "$MODEL" in
-        *"qfx5110"*|*"qfx5120"*)
-            log_message "NOTICE" "Skipping validation for $MODEL"
-            return
-            ;;
-        *"ptx"*|*"jnp"*|*"mx304"*)
-            log_message "COMMAND" "request vmhost software validate $FIRMWARE_FILE"
-            cli -c "request vmhost software validate $FIRMWARE_FILE"
-            ;;
-        *"ex4600"*|*"srx4100"*|*"srx1500"*)
-            log_message "COMMAND" "request system software validate $FIRMWARE_FILE"
-            cli -c "request system software validate $FIRMWARE_FILE"
-            ;;
-        *)
-            log_message "COMMAND" "request system software validate $FIRMWARE_FILE"
-            cli -c "request system software validate $FIRMWARE_FILE"
-            ;;
-    esac
+#     case "$MODEL" in
+#         *"qfx5110"*|*"qfx5120"*)
+#             log_message "NOTICE" "Skipping validation for $MODEL"
+#             return
+#             ;;
+#         *"ptx"*|*"jnp"*|*"mx304"*)
+#             log_message "COMMAND" "request vmhost software validate $FIRMWARE_FILE"
+#             cli -c "request vmhost software validate $FIRMWARE_FILE"
+#             ;;
+#         *"ex4600"*|*"srx4100"*|*"srx1500"*)
+#             log_message "COMMAND" "request system software validate $FIRMWARE_FILE"
+#             cli -c "request system software validate $FIRMWARE_FILE"
+#             ;;
+#         *)
+#             log_message "COMMAND" "request system software validate $FIRMWARE_FILE"
+#             cli -c "request system software validate $FIRMWARE_FILE"
+#             ;;
+#     esac
 
-    if [ $? -ne 0 ]; then
-        handle_error "Firmware validation failed"
-    fi
+#     if [ $? -ne 0 ]; then
+#         handle_error "Firmware validation failed"
+#     fi
 
-    log_message "NOTICE" "Firmware verification passed"
-}
+#     log_message "NOTICE" "Firmware verification passed"
+# }
 
 # CONFIG CHECKS
 # Configuration verification function
@@ -452,35 +463,149 @@ test_destructive_commands() {
     return $failed
 }
 
+check_character() {
+    local file="$1"
+    local char="$2"
+    while IFS= read -r line
+    do
+        #log_message "INFO" "$line"
+        if grep -q "{" "$file"; then
+            return 0   # True in shell
+        fi
+    done < "$file"
+    return 1    # False in shell
+}
 
-# MAIN EXECUTION FLOW
+download_configuration() {
+    local retry_count=0
+    local success=false
+
+    while [ $retry_count -lt $MAX_RETRIES ] && [ "$success" = false ]; do
+        log_message "INFO" "Downloading configuration (Attempt $((retry_count + 1)) of $MAX_RETRIES)"
+        
+        # Try to download configuration
+        #log_message "COMMAND" "tftp -JG $REMOTE_SERVER:$CONFIG_FILE $CONFIG_PATH"
+        tftp -JG $REMOTE_SERVER:$CONFIG_FILE $CONFIG_PATH
+        if [ $? -eq 0 ]; then
+            FULL_CONFIG_PATH="${CONFIG_PATH}/${CONFIG_FILE}"
+            log_message "INFO" "Configuration download complete"
+            log_message "INFO" "Verifying configuration..."
+            if [ -f "$FULL_CONFIG_PATH" ]; then
+                
+                log_message "INFO" "Configuration verified. Download successful"
+                #log_message "DEBUG" "$(cat $FULL_CONFIG_PATH)"
+                success=true
+                break
+            else
+                log_message "INFO" "Configuration verification failed"
+                log_message "WARNING" "Configuration file not found at $FULL_CONFIG_PATH"
+            fi
+        else
+            log_message "WARNING" "TFTP download failed"
+        fi
+
+        retry_count=$((retry_count + 1))
+        if [ $retry_count -lt $MAX_RETRIES ]; then
+            log_message "WARNING" "Download failed, retrying in 10 seconds..."
+            sleep 10
+        else
+            log_message "ERROR" "Download failed after $MAX_RETRIES attempts"
+            handle_error "Configuration download failed"
+            return 1
+        fi
+    done
+
+    if [ "$success" = false ]; then
+        handle_error "Failed to download configuration after $MAX_RETRIES attempts"
+        return 1
+    fi
+    return 0
+}
+
+apply_configuration_with_retries() {
+    local retry_count=0
+    local success=false
+
+    while [ $retry_count -lt $MAX_RETRIES ] && [ "$success" = false ]; do
+        log_message "INFO" "Applying configuration (Attempt $((retry_count + 1)) of $MAX_RETRIES)"
+        
+        log_message "DEBUG" "Loading configuration and comparing with rollback"
+        log_message "COMMAND" "configure exclusive; load override $FULL_CONFIG_PATH; show | compare"
+        COMPARE_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; show | compare")
+        
+        if [ $? -eq 0 ]; then
+            log_message "INFO" "Configuration loaded, attempting commit"
+            
+            if check_character "$FULL_CONFIG_PATH" '{'; then
+                log_message "INFO" "Configuration is in JSON format, applying JSON command"
+                COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH json; commit")
+                #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH json")
+            else
+                log_message "INFO" "Configuration is in SET format, applying SET command"
+                COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; commit")
+                #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH")
+            fi
+            
+            log_message "DEBUG" "Commit output: $COMMIT_OUTPUT"
+            
+            if echo "$COMMIT_OUTPUT" | grep -qi "error\|failed\|unknown command"; then
+            log_message "ERROR" "Configuration commit failed"
+            success=false
+            else
+                log_message "INFO" "Configuration applied successfully"
+                success=true
+                break
+            fi
+        fi
+
+        retry_count=$((retry_count + 1))
+        if [ $retry_count -lt $MAX_RETRIES ]; then
+            log_message "WARNING" "Configuration application failed, retrying in 30 seconds..."
+            sleep 30
+        else
+            log_message "ERROR" "Configuration application failed after $MAX_RETRIES attempts"
+            handle_error "Configuration application failed"
+            return 1
+        fi
+    done
+
+    if [ "$success" = false ]; then
+        handle_error "Failed to apply configuration after $MAX_RETRIES attempts"
+        return 1
+    fi
+
+    log_message "DEBUG" "Verifying configuration was applied"
+    VERIFY_OUTPUT=$(cli -c "show configuration | display set")
+    # log_message "DEBUG" "Current configuration: $VERIFY_OUTPUT"
+
+    return 0
+}
+
 main() {
     log_message "NOTICE" "Starting ZTP process"
     log_message "NOTICE" "Host: $HOSTNAME"
     log_message "INFO" "*** PRE-CHECKS ***"
-    running_shell=$(ps -p $$)
+    running_shell=$(ps -p $$ | tail -1 | awk '{print $4}')
     log_message "NOTICE" "Current shell: $running_shell"
     log_message "INFO" "*** PRE-CHECKS COMPLETE***"
-    log_message "INFO" "*****************************************"
-    log_message "INFO" "*****************************************"
-    
-    log_message "INFO" "TARGET_FIRMWARE_FILE: $TARGET_FIRMWARE_FILE"
-    log_message "INFO" "TARGET_VERSION: $TARGET_VERSION"
-    
+
     # Version check
     log_message "INFO" "*** COMMAND SET PHASE ***"
+    log_message "INFO" "TARGET_FIRMWARE_FILE: $TARGET_FIRMWARE_FILE"
+    log_message "INFO" "TARGET_VERSION: $TARGET_VERSION"
     check_version
     log_message "INFO" "*** COMMAND SET PHASE COMPLETE ***"
-    log_message "INFO" "*****************************************"
-    log_message "INFO" "*****************************************"
 
     # Firmware upgrade if needed
-    log_message "INFO" "*** FIRMWARE PHASE ***"
+    log_message "INFO" "*** FIRMWARE COMPLIANCE PHASE ***"
+    log_message "INFO" "Checking firmware version compliance..."
     log_message "INFO" "CURRENT_VERSION: $CURRENT_VERSION"
     log_message "INFO" "TARGET_VERSION: $TARGET_VERSION"
     
+    
     if [ "$CURRENT_VERSION" != "$TARGET_VERSION" ]; then
-        log_message "NOTICE" "Firmware upgrade needed"
+        log_message "NOTICE" "Current firmware version not compliant"
+        log_message "NOTICE" "Beginning firmware upgrade..."
 
         # Initial health check
         log_message "INFO" "*** CHECK SYSTEM HEALTH PHASE ***"
@@ -490,20 +615,22 @@ main() {
         log_message "INFO" "*****************************************"
         log_message "INFO" "Starting firmware download: $TARGET_FIRMWARE_FILE"
         log_message "NOTICE" "Starting firmware installation"
+
         
         if [ -n "$FORCE_HOST" ]; then
             log_message "COMMAND" "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $FORCE_HOST"
             INSTALL_OUTPUT=$(cli -c "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $FORCE_HOST" 2>&1)
         else
             if [ -n "$SKIP_VALIDATION" ]; then
-                log_message "COMMAND" "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $SKIP_VALIDATION"
-                INSTALL_OUTPUT=$(cli -c "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $SKIP_VALIDATION" 2>&1)
+                log_message "COMMAND" "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $SKIP_VALIDATION reboot"
+                INSTALL_OUTPUT=$(cli -c "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $SKIP_VALIDATION reboot" 2>&1)
             else
                 log_message "COMMAND" "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE validate unlink"
                 INSTALL_OUTPUT=$(cli -c "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE validate unlink" 2>&1)
             fi
         fi
         INSTALL_STATUS=$?
+        log_message "DEBUG" "INSTALL_OUTPUT: $INSTALL_OUTPUT"
         if echo "$INSTALL_OUTPUT" | grep -qi "ERROR\|Operation timed out\|Cannot fetch file"; then
             log_message "ERROR" "Firmware installation failed with output: $INSTALL_OUTPUT"
             handle_error "Firmware installation failed"
@@ -517,63 +644,34 @@ main() {
         fi
 
         if [ $INSTALL_STATUS -eq 0 ]; then
-            log_message "NOTICE" "Firmware installed successfully, reapplying auto-image-upgrade, then rebooting"
-            log_message "COMMAND" "configure exclusive; set chassis auto-image-upgrade; commit; exit"
-            REAPPLY_AUTO_IMAGE_UPGRADE=$(cli -c "configure exclusive; set chassis auto-image-upgrade; commit; exit")
-            log_message "DEBUG" "REAPPLY_AUTO_IMAGE_UPGRADE: $REAPPLY_AUTO_IMAGE_UPGRADE"
-            cli -c "request system reboot"
-            exit 0
-        fi
-    fi
-    
-    log_message "INFO" "*** FIRMWARE PHASE COMPLETE ***"
-    log_message "INFO" "*****************************************"
-    log_message "INFO" "*****************************************"
-
-    # Configuration application
-    log_message "INFO" "*** CONFIGURATION PHASE ***"
-
-    log_message "INFO" "Downloading configuration"
-    pwd_response=`pwd`
-    log_message "INFO" "pwd_response: $pwd_response"
-    tftp -JG $REMOTE_SERVER:$CONFIG_FILE $CONFIG_PATH
-    if [ $? -ne 0 ]; then
-        handle_error "Configuration download failed"
-    fi
-    
-    FULL_CONFIG_PATH="${CONFIG_PATH}/${CONFIG_FILE}"
-    if [ ! -f "$FULL_CONFIG_PATH" ]; then
-        handle_error "Configuration file not found at $FULL_CONFIG_PATH"
-        exit 1
-    fi
-
-    verify_config
-    log_message "DEBUG" "Configuration file content:"
-    log_message "DEBUG" "$(cat $FULL_CONFIG_PATH)"
-    log_message "INFO" "Config: $(cli -c "file show $FULL_CONFIG_PATH")"
-    log_message "DEBUG" "Loading configuration and comparing with rollback"
-    log_message "COMMAND" "configure exclusive; load override $FULL_CONFIG_PATH; show | compare"
-    COMPARE_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; show | compare")
-    if [ $? -eq 0 ]; then
-        log_message "INFO" "Configuration loaded, attempting commit"
-        COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; commit")
-        COMMIT_STATUS=$?
-        log_message "DEBUG" "Commit output: $COMMIT_OUTPUT"
-        log_message "DEBUG" "Commit status: $COMMIT_STATUS"
-        
-        if [ $COMMIT_STATUS -ne 0 ]; then
-            log_message "ERROR" "Failed to commit configuration"
-            handle_error "Configuration commit failed"
+            log_message "NOTICE" "Firmware installed successfully, now rebooting"
+            # log_message "COMMAND" "configure exclusive; set chassis auto-image-upgrade; commit; exit"
+            # REAPPLY_AUTO_IMAGE_UPGRADE=$(cli -c "configure exclusive; set chassis auto-image-upgrade; commit; exit")
+            # log_message "DEBUG" "REAPPLY_AUTO_IMAGE_UPGRADE: $REAPPLY_AUTO_IMAGE_UPGRADE"
+            #cli -c "request system reboot"
             exit 1
         fi
-    else
-        log_message "ERROR" "Failed to load configuration"
-        handle_error "Configuration load failed"
+    fi
+    log_message "NOTICE" "Firmware version is compliant"
+    log_message "INFO" "*** FIRMWARE COMPLIANCE PHASE COMPLETE ***"
+    
+
+    log_message "INFO" "*** CONFIGURATION PHASE ***"
+
+    # download and verify config
+    if ! download_configuration; then
         exit 1
     fi
+    log_message "INFO" "Verifying downloaded configuration"
+    
+    # apply config
+    if ! apply_configuration_with_retries; then
+        log_message "ERROR" "Configuration application phase failed"
+        exit 1
+    fi
+    log_message "INFO" "Configuration application phase completed successfully"
 
     log_message "DEBUG" "Verifying configuration was applied"
-    VERIFY_OUTPUT=$(cli -c "show configuration | display set")
     log_message "DEBUG" "Current configuration: $VERIFY_OUTPUT"
 
     log_message "INFO" "*** CONFIGURATION PHASE COMPLETE ***"
