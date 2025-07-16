@@ -11,15 +11,17 @@
 # ztp log: /var/log/
 
 # Variables
+# Variables
 HOSTNAME="{hostname}"
 REMOTE_SERVER="{tftp_server}" 
 CONFIG_PATH="/var/tmp/"
-FIRMWARE_PATH="/var/tmp/" # Relates to the URL path used in the request system add command /ex4300
-MAX_RETRIES=3
-CONFIG_FILE="$HOSTNAME.cfg"
+FIRMWARE_PATH="/var/tmp/"
+
+CONFIG_FILE="$HOSTNAME.cfg" 
 LOG_FILE="/var/log/ztp-upgrade.log"
 TARGET_FIRMWARE_FILE="{target_version}"
 FIRMWARE_PATH=""
+
 
 # grep version number
 TARGET_VERSION=$(echo "$TARGET_FIRMWARE_FILE" | grep -o "[0-9][0-9]\.[0-9].*" | sed 's/[a-zA-Z].*//')
@@ -537,8 +539,8 @@ apply_configuration_with_retries() {
             log_message "INFO" "Configuration loaded, attempting commit"
             
             if check_character "$FULL_CONFIG_PATH" '{'; then
-                log_message "INFO" "Configuration is in JSON format, applying JSON command"
-                COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH json; commit")
+                log_message "INFO" "Configuration is in Junos curly brace format, applying command"
+                COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; commit")
                 #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH json")
             else
                 log_message "INFO" "Configuration is in SET format, applying SET command"
