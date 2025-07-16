@@ -10,18 +10,22 @@
 # firmware image: /var/tmp/
 # ztp log: /var/log/
 
-# Variables
+
 # Variables
 HOSTNAME="{hostname}"
 REMOTE_SERVER="{tftp_server}" 
 CONFIG_PATH="/var/tmp/"
 FIRMWARE_PATH="/var/tmp/"
 
-CONFIG_FILE="$HOSTNAME.cfg" 
-LOG_FILE="/var/log/ztp-upgrade.log"
-TARGET_FIRMWARE_FILE="{target_version}"
-FIRMWARE_PATH=""
+MAX_RETRIES=3
+RETRY_DELAY=30  # seconds between retries
+REBOOT_WAIT=10  # seconds to wait for reboot
+MAX_INSTALL_TIME=600  # 10 minutes timeout for installation
 
+CONFIG_FILE="$HOSTNAME.cfg"
+LOG_FILE="/var/log/ztp-upgrade.log"
+TARGET_FIRMWARE_FILE="jinstall-ex-4300-21.4R3-S4.18-signed.tgz"
+#TARGET_FIRMWARE_FILE="jinstall-ex-4300-18.4R3.3-signed.tgz"
 
 # grep version number
 TARGET_VERSION=$(echo "$TARGET_FIRMWARE_FILE" | grep -o "[0-9][0-9]\.[0-9].*" | sed 's/[a-zA-Z].*//')
@@ -185,13 +189,9 @@ validate_version() {
     if [ -z "$CURRENT_VERSION" ] || [ -z "$TARGET_VERSION" ]; then
         handle_error "Invalid version information"
     fi
-
-    # if ! echo "$TARGET_VERSION" | grep -q "^[0-9]\+\.[0-9]\+[A-Z][0-9]\+\.[0-9]\+$"; then
-    #     handle_error "Invalid version format: $TARGET_VERSION"
-    # fi
 }
 
-
+# To delete, or not to delete; that is the question
 # Firmware verification function
 # verify_firmware() {
 #     if [ "$TEST_MODE" = true ]; then
@@ -258,12 +258,12 @@ process_storage_mount_points() {
     _free_space=0
     JUNOS_BYTES_PER_BLOCK=1024
 
-    log_message "INFO" "_possible_mount_points: $_possible_mount_points"
+    #log_message "INFO" "_possible_mount_points: $_possible_mount_points"
     for mount_point in $_possible_mount_points; do
-        log_message "INFO" "mount_point: $mount_point"
+        #log_message "INFO" "mount_point: $mount_point"
         # Modified grep to be more precise about mount point matching
         line_match=$(echo "$_storage_output" | grep "[[:space:]]${mount_point}[[:space:]]*$")
-        log_message "INFO" "line_match: $line_match"
+        #log_message "INFO" "line_match: $line_match"
         if [ "$line_match" ]; then
             _target_filesystem=$(echo "$line_match" | awk '{print $1}')
             _available_blocks=$(echo "$line_match" | awk '{print $4}')
@@ -292,10 +292,10 @@ check_system_health() {
     # Get file list and storage information
     log_message "COMMAND" "Executing: $file_list_cmd"
     file_list_output=$(cli -c "$file_list_cmd")
-    log_message "Result" "file_list_output: $file_list_output"
-    log_message "COMMAND" "Executing: $storage_cmd"
+    #log_message "Result" "file_list_output: $file_list_output"
+    #log_message "COMMAND" "Executing: $storage_cmd"
     storage_output=$(cli -c "$storage_cmd")
-    log_message "Result" "storage_output: $storage_output"
+    #log_message "Result" "storage_output: $storage_output"
     if [ $? -ne 0 ]; then
         log_message "WARNING" "Could not fetch list of files from dir on device"
         return 1
@@ -312,7 +312,7 @@ check_system_health() {
         possible_mount_points="$possible_mount_points $JUNOS_ALTERNATIVE_ROOT_PATH$current_dir /.mount/tmp /.mount/hostvar"
     done
     # Remove duplicates
-    log_message "Result" "possible_mount_points: $possible_mount_points"
+    #log_message "Result" "possible_mount_points: $possible_mount_points"
 
     # Find target filesystem
     target_filesystem=""
@@ -401,69 +401,6 @@ cli_execute() {
     echo "$result"
 }
 
-# Test destructive commands safely
-test_destructive_commands() {
-    log_message "NOTICE" "Testing destructive commands in safe mode"
-    local failed=0
-
-    # Test configuration commands
-    log_message "INFO" "Testing configuration commands"
-
-    # Test configure exclusive (dry run)
-    log_message "COMMAND" "configure exclusive"
-    if cli -c "configure exclusive" >/dev/null 2>&1; then
-        log_message "RESULT" "✓ Can enter exclusive configuration mode"
-        cli -c "exit" >/dev/null 2>&1
-    else
-        log_message "ERROR" "✗ Cannot enter exclusive configuration mode"
-        failed=$((failed + 1))
-    fi
-
-    # Test commit syntax
-    log_message "COMMAND" "commit check"
-    if cli -c "configure exclusive; commit check; exit" >/dev/null 2>&1; then
-        log_message "RESULT" "✓ Commit check command available"
-    else
-        log_message "ERROR" "✗ Commit check failed"
-        failed=$((failed + 1))
-    fi
-
-    # Test firmware commands based on model
-    log_message "INFO" "Testing firmware commands"
-    case "$MODEL" in
-        *"srx4100"*|*"srx1500"*)
-            cmd="request system software validate ?"
-            ;;
-        *"ptx"*|*"jnp"*|*"mx304"*)
-            cmd="request vmhost software validate ?"
-            ;;
-        *)
-            cmd="request system software validate ?"
-            ;;
-    esac
-
-    log_message "COMMAND" "$cmd"
-    if cli -c "$cmd" >/dev/null 2>&1; then
-        log_message "RESULT" "✓ Firmware validation command available"
-    else
-        log_message "ERROR" "✗ Firmware validation command not available"
-        failed=$((failed + 1))
-    fi
-
-    # Test file operations safely
-    log_message "INFO" "Testing file operations"
-
-    # Test file command syntax
-    log_message "COMMAND" "file ?"
-    if cli -c "file ?" >/dev/null 2>&1; then
-        log_message "RESULT" "✓ File operations available"
-    else
-        log_message "ERROR" "✗ File operations not available"
-        failed=$((failed + 1))
-    fi
-
-    return $failed
-}
 
 check_character() {
     local file="$1"
@@ -541,11 +478,11 @@ apply_configuration_with_retries() {
             if check_character "$FULL_CONFIG_PATH" '{'; then
                 log_message "INFO" "Configuration is in Junos curly brace format, applying command"
                 COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; commit")
-                #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH json")
+                #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH") FOR TESTING
             else
                 log_message "INFO" "Configuration is in SET format, applying SET command"
                 COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; commit")
-                #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH")
+                #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH") FOR TESTING
             fi
             
             log_message "DEBUG" "Commit output: $COMMIT_OUTPUT"
@@ -583,6 +520,118 @@ apply_configuration_with_retries() {
     return 0
 }
 
+
+download_image() {
+    local retry_count=0
+    local start_time
+
+    log_message "INFO" "Starting firmware download and installation process"
+
+    while [ $retry_count -lt $MAX_RETRIES ]; do
+        retry_count=$((retry_count + 1))
+        log_message "INFO" "Download attempt $retry_count of $MAX_RETRIES"
+
+        # Prepare upgrade command
+        prepare_upgrade_command || {
+            log_message "ERROR" "Failed to prepare upgrade command"
+            continue
+        }
+
+        # Start timer for installation
+        start_time=$(date +%s)
+
+        # Execute upgrade with timeout
+        log_message "COMMAND" "$UPGRADE_CMD_FULL"
+        if ! INSTALL_OUTPUT=$(timeout $MAX_INSTALL_TIME cli -c "$UPGRADE_CMD_FULL" 2>&1); then
+            INSTALL_STATUS=$?
+            log_message "ERROR" "Installation attempt $retry_count failed with status: $INSTALL_STATUS"
+            
+            if [ $retry_count -lt $MAX_RETRIES ]; then
+                log_message "NOTICE" "Waiting $RETRY_DELAY seconds before next attempt"
+                sleep $RETRY_DELAY
+                continue
+            else
+                handle_error "All installation attempts failed"
+                return 1
+            fi
+        fi
+
+        # Check for errors in output
+        if echo "$INSTALL_OUTPUT" | grep -qi "ERROR\|Operation timed out\|Cannot fetch file"; then
+            log_message "ERROR" "Firmware installation failed with output: $INSTALL_OUTPUT"
+            
+            if [ $retry_count -lt $MAX_RETRIES ]; then
+                log_message "NOTICE" "Waiting $RETRY_DELAY seconds before next attempt"
+                sleep $RETRY_DELAY
+                continue
+            else
+                handle_error "All installation attempts failed"
+                return 1
+            fi
+        fi
+
+        # If we get here, installation was successful
+        log_message "NOTICE" "Firmware installed successfully"
+        
+        # Attempt reboot with retries
+        if ! attempt_reboot; then
+            log_message "ERROR" "Reboot failed after successful installation"
+            return 1
+        fi
+
+        return 0
+    done
+
+    handle_error "Exceeded maximum retry attempts"
+    return 1
+}
+
+prepare_upgrade_command() {
+    UPGRADE_CMD_FULL=""
+    if [ -n "$FORCE_HOST" ]; then
+        UPGRADE_CMD_FULL="$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $FORCE_HOST"
+    else
+        if [ -n "$SKIP_VALIDATION" ]; then
+            UPGRADE_CMD_FULL="$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $SKIP_VALIDATION"
+        else
+            UPGRADE_CMD_FULL="$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE validate unlink"
+        fi
+    fi
+    
+    [ -n "$UPGRADE_CMD_FULL" ] || return 1
+    return 0
+}
+
+attempt_reboot() {
+    local reboot_retries=3
+    local reboot_retry_count=0
+
+    while [ $reboot_retry_count -lt $reboot_retries ]; do
+        reboot_retry_count=$((reboot_retry_count + 1))
+        log_message "NOTICE" "Initiating system reboot (attempt $reboot_retry_count)"
+        
+        REBOOT_OUTPUT=$(cli -c "request system reboot" 2>&1)
+        REBOOT_STATUS=$?
+        
+        if [ $REBOOT_STATUS -eq 0 ] && ! echo "$REBOOT_OUTPUT" | grep -qi "ERROR"; then
+            log_message "NOTICE" "Reboot command issued successfully"
+            sleep $REBOOT_WAIT
+            
+            # If we're still running after sleep, something went wrong
+            log_message "ERROR" "System failed to reboot after firmware installation"
+            return 1
+        fi
+        
+        if [ $reboot_retry_count -lt $reboot_retries ]; then
+            log_message "WARNING" "Reboot attempt failed, retrying in 5 seconds..."
+            sleep 5
+        fi
+    done
+
+    return 1
+}
+
+
 main() {
     log_message "NOTICE" "Starting ZTP process"
     log_message "NOTICE" "Host: $HOSTNAME"
@@ -612,54 +661,18 @@ main() {
         # Initial health check
         log_message "INFO" "*** CHECK SYSTEM HEALTH PHASE ***"
         check_system_health
+        download_image
         log_message "INFO" "*** CHECK SYSTEM HEALTH PHASE COMPLETE ***"
-        log_message "INFO" "*****************************************"
-        log_message "INFO" "*****************************************"
-        log_message "INFO" "Starting firmware download: $TARGET_FIRMWARE_FILE"
-        log_message "NOTICE" "Starting firmware installation"
-
         
-        if [ -n "$FORCE_HOST" ]; then
-            log_message "COMMAND" "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $FORCE_HOST"
-            INSTALL_OUTPUT=$(cli -c "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $FORCE_HOST" 2>&1)
-        else
-            if [ -n "$SKIP_VALIDATION" ]; then
-                log_message "COMMAND" "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $SKIP_VALIDATION reboot"
-                INSTALL_OUTPUT=$(cli -c "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE $SKIP_VALIDATION reboot" 2>&1)
-            else
-                log_message "COMMAND" "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE validate unlink"
-                INSTALL_OUTPUT=$(cli -c "$UPGRADE_CMD http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE validate unlink" 2>&1)
-            fi
-        fi
-        INSTALL_STATUS=$?
-        log_message "DEBUG" "INSTALL_OUTPUT: $INSTALL_OUTPUT"
-        if echo "$INSTALL_OUTPUT" | grep -qi "ERROR\|Operation timed out\|Cannot fetch file"; then
-            log_message "ERROR" "Firmware installation failed with output: $INSTALL_OUTPUT"
-            handle_error "Firmware installation failed"
-            exit 1
-        fi
+        log_message "INFO" "*** FIRMWARE IMAGE ***" 
 
-        if [ $INSTALL_STATUS -ne 0 ]; then
-            log_message "ERROR" "Firmware installation failed with status: $INSTALL_STATUS"
-            handle_error "Firmware installation failed"
-            exit 1
-        fi
-
-        if [ $INSTALL_STATUS -eq 0 ]; then
-            log_message "NOTICE" "Firmware installed successfully, now rebooting"
-            # log_message "COMMAND" "configure exclusive; set chassis auto-image-upgrade; commit; exit"
-            # REAPPLY_AUTO_IMAGE_UPGRADE=$(cli -c "configure exclusive; set chassis auto-image-upgrade; commit; exit")
-            # log_message "DEBUG" "REAPPLY_AUTO_IMAGE_UPGRADE: $REAPPLY_AUTO_IMAGE_UPGRADE"
-            #cli -c "request system reboot"
-            exit 1
-        fi
     fi
+
     log_message "NOTICE" "Firmware version is compliant"
     log_message "INFO" "*** FIRMWARE COMPLIANCE PHASE COMPLETE ***"
     
 
     log_message "INFO" "*** CONFIGURATION PHASE ***"
-
     # download and verify config
     if ! download_configuration; then
         exit 1
@@ -671,22 +684,14 @@ main() {
         log_message "ERROR" "Configuration application phase failed"
         exit 1
     fi
+
     log_message "INFO" "Configuration application phase completed successfully"
-
-    log_message "DEBUG" "Verifying configuration was applied"
-    log_message "DEBUG" "Current configuration: $VERIFY_OUTPUT"
-
     log_message "INFO" "*** CONFIGURATION PHASE COMPLETE ***"
-    log_message "INFO" "*****************************************"
-    log_message "INFO" "*****************************************"
 
     # Final verification
     log_message "INFO" "*** FINAL HEALTH CHECK PHASE ***"
     check_system_health
     log_message "INFO" "*** FINAL HEALTH CHECK PHASE COMPLETE ***"
-    log_message "INFO" "*****************************************"
-    log_message "INFO" "*****************************************"
-
     log_message "NOTICE" "ZTP process completed successfully"
 }
 
