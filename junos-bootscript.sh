@@ -10,22 +10,22 @@
 # firmware image: /var/tmp/
 # ztp log: /var/log/
 
-
 # Variables
-HOSTNAME="{hostname}"
-REMOTE_SERVER="{tftp_server}" 
+HOSTNAME="{{Hostname}}"
+REMOTE_SERVER="{{tftp_server}}"
+CONFIG_FILE="{{config_file}}"
+TARGET_FIRMWARE_FILE="{{firmware_file}}"
+
 CONFIG_PATH="/var/tmp/"
-FIRMWARE_PATH="/var/tmp/"
+FIRMWARE_PATH="/var/tmp/" # Relates to the URL path used in the request system add command /ex4300
 
 MAX_RETRIES=3
 RETRY_DELAY=30  # seconds between retries
 REBOOT_WAIT=10  # seconds to wait for reboot
 MAX_INSTALL_TIME=600  # 10 minutes timeout for installation
 
-CONFIG_FILE="$HOSTNAME.cfg"
 LOG_FILE="/var/log/ztp-upgrade.log"
-TARGET_FIRMWARE_FILE="jinstall-ex-4300-21.4R3-S4.18-signed.tgz"
-#TARGET_FIRMWARE_FILE="jinstall-ex-4300-18.4R3.3-signed.tgz"
+# TARGET_FIRMWARE_FILE="jinstall-ex-4300-18.4R3.3-signed.tgz"
 
 # grep version number
 TARGET_VERSION=$(echo "$TARGET_FIRMWARE_FILE" | grep -o "[0-9][0-9]\.[0-9].*" | sed 's/[a-zA-Z].*//')
@@ -312,7 +312,7 @@ check_system_health() {
         possible_mount_points="$possible_mount_points $JUNOS_ALTERNATIVE_ROOT_PATH$current_dir /.mount/tmp /.mount/hostvar"
     done
     # Remove duplicates
-    #log_message "Result" "possible_mount_points: $possible_mount_points"
+    # log_message "Result" "possible_mount_points: $possible_mount_points"
 
     # Find target filesystem
     target_filesystem=""
@@ -407,7 +407,7 @@ check_character() {
     local char="$2"
     while IFS= read -r line
     do
-        #log_message "INFO" "$line"
+        # log_message "INFO" "$line"
         if grep -q "{" "$file"; then
             return 0   # True in shell
         fi
@@ -423,7 +423,7 @@ download_configuration() {
         log_message "INFO" "Downloading configuration (Attempt $((retry_count + 1)) of $MAX_RETRIES)"
         
         # Try to download configuration
-        #log_message "COMMAND" "tftp -JG $REMOTE_SERVER:$CONFIG_FILE $CONFIG_PATH"
+        # log_message "COMMAND" "tftp -JG $REMOTE_SERVER:$CONFIG_FILE $CONFIG_PATH"
         tftp -JG $REMOTE_SERVER:$CONFIG_FILE $CONFIG_PATH
         if [ $? -eq 0 ]; then
             FULL_CONFIG_PATH="${CONFIG_PATH}/${CONFIG_FILE}"
@@ -432,7 +432,7 @@ download_configuration() {
             if [ -f "$FULL_CONFIG_PATH" ]; then
                 
                 log_message "INFO" "Configuration verified. Download successful"
-                #log_message "DEBUG" "$(cat $FULL_CONFIG_PATH)"
+                # log_message "DEBUG" "$(cat $FULL_CONFIG_PATH)"
                 success=true
                 break
             else
@@ -478,11 +478,11 @@ apply_configuration_with_retries() {
             if check_character "$FULL_CONFIG_PATH" '{'; then
                 log_message "INFO" "Configuration is in Junos curly brace format, applying command"
                 COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; commit")
-                #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH") FOR TESTING
+                # COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH") FOR TESTING
             else
                 log_message "INFO" "Configuration is in SET format, applying SET command"
                 COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH; commit")
-                #COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH") FOR TESTING
+                # COMMIT_OUTPUT=$(cli -c "configure exclusive; load override $FULL_CONFIG_PATH") FOR TESTING
             fi
             
             log_message "DEBUG" "Commit output: $COMMIT_OUTPUT"
@@ -697,4 +697,28 @@ main() {
 
 
 # Execute main function
-main
+
+if [ -n "$TARGET_FIRMWARE_FILE" ]; then
+    log_message "NOTICE" "Starting full ZTP process with firmware checks"
+    main
+else
+    log_message "NOTICE" "Starting simple config-only ZTP process"
+        log_message "INFO" "*** CONFIGURATION PHASE ***"
+    # download and verify config
+    if ! download_configuration; then
+        exit 1
+    fi
+    log_message "INFO" "Verifying downloaded configuration"
+    
+    # apply config
+    if ! apply_configuration_with_retries; then
+        log_message "ERROR" "Configuration application phase failed"
+        exit 1
+    fi
+
+    log_message "INFO" "Configuration application phase completed successfully"
+    log_message "INFO" "*** CONFIGURATION PHASE COMPLETE ***"
+
+    # Final verification
+    log_message "NOTICE" "ZTP process completed successfully"
+fi
