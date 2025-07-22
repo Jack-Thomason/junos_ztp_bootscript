@@ -15,6 +15,7 @@ HOSTNAME="{{Hostname}}"
 REMOTE_SERVER="{{tftp_server}}"
 CONFIG_FILE="{{config_file}}"
 TARGET_FIRMWARE_FILE="{{firmware_file}}"
+TARGET_FIRMWARE_MD5="{{firmware_file_md5}}"
 
 CONFIG_PATH="/var/tmp/"
 FIRMWARE_PATH="/var/tmp/" # Relates to the URL path used in the request system add command /ex4300
@@ -25,7 +26,6 @@ REBOOT_WAIT=10  # seconds to wait for reboot
 MAX_INSTALL_TIME=600  # 10 minutes timeout for installation
 
 LOG_FILE="/var/log/ztp-upgrade.log"
-# TARGET_FIRMWARE_FILE="jinstall-ex-4300-18.4R3.3-signed.tgz"
 
 # grep version number
 TARGET_VERSION=$(echo "$TARGET_FIRMWARE_FILE" | grep -o "[0-9][0-9]\.[0-9].*" | sed 's/[a-zA-Z].*//')
@@ -191,44 +191,33 @@ validate_version() {
     fi
 }
 
-# To delete, or not to delete; that is the question
 # Firmware verification function
-# verify_firmware() {
-#     if [ "$TEST_MODE" = true ]; then
-#         log_message "NOTICE" "Test Mode: Verifying firmware"
-#         log_message "INFO" "Would verify firmware: $FIRMWARE_FILE"
-#         return 0
-#     fi
+verify_firmware_md5() {
+    local firmware_file="$1"
+    local expected_md5="$2"
+    
+    log_message "INFO" "Verifying firmware MD5 checksum"
+    
+    # Get MD5 of downloaded file using Junos CLI
+    local calculated_md5
+    calculated_md5=$(cli -c "file checksum md5 $firmware_file" | awk '{print $NF}')
+    
+    if [ -z "$calculated_md5" ]; then
+        log_message "ERROR" "Failed to calculate MD5 for firmware file"
+        return 1
+    fi
+    
+    log_message "INFO" "Expected MD5: $expected_md5"
+    log_message "INFO" "Calculated MD5: $calculated_md5"
 
-#     if [ ! -f $FIRMWARE_FILE ]; then
-#         handle_error "Firmware file not found"
-#     fi
-
-#     case "$MODEL" in
-#         *"qfx5110"*|*"qfx5120"*)
-#             log_message "NOTICE" "Skipping validation for $MODEL"
-#             return
-#             ;;
-#         *"ptx"*|*"jnp"*|*"mx304"*)
-#             log_message "COMMAND" "request vmhost software validate $FIRMWARE_FILE"
-#             cli -c "request vmhost software validate $FIRMWARE_FILE"
-#             ;;
-#         *"ex4600"*|*"srx4100"*|*"srx1500"*)
-#             log_message "COMMAND" "request system software validate $FIRMWARE_FILE"
-#             cli -c "request system software validate $FIRMWARE_FILE"
-#             ;;
-#         *)
-#             log_message "COMMAND" "request system software validate $FIRMWARE_FILE"
-#             cli -c "request system software validate $FIRMWARE_FILE"
-#             ;;
-#     esac
-
-#     if [ $? -ne 0 ]; then
-#         handle_error "Firmware validation failed"
-#     fi
-
-#     log_message "NOTICE" "Firmware verification passed"
-# }
+    if [ "$calculated_md5" = "$expected_md5" ]; then
+        log_message "NOTICE" "Firmware MD5 verification passed"
+        return 0
+    else
+        log_message "ERROR" "Firmware MD5 verification failed"
+        return 1
+    fi
+}
 
 # CONFIG CHECKS
 # Configuration verification function
@@ -449,7 +438,7 @@ download_configuration() {
             sleep 10
         else
             log_message "ERROR" "Download failed after $MAX_RETRIES attempts"
-            handle_error "Configuration download failed"
+            handle_error "Configuration download failed"    
             return 1
         fi
     done
@@ -524,67 +513,89 @@ apply_configuration_with_retries() {
 download_image() {
     local retry_count=0
     local start_time
+    local local_path="/var/tmp/$TARGET_FIRMWARE_FILE"
 
     log_message "INFO" "Starting firmware download and installation process"
 
+    # Check if firmware exists locally first
+    log_message "INFO" "Checking for existing firmware file: $local_path"
+    if [ -f "$local_path" ]; then
+        log_message "INFO" "Found existing firmware file, verifying MD5"
+        if verify_firmware_md5 "$local_path" "$TARGET_FIRMWARE_MD5"; then
+            log_message "NOTICE" "Existing firmware file verified successfully"
+            # Install the existing firmware
+            log_message "INFO" "Installing existing firmware file"
+            INSTALL_OUTPUT=$(cli -c "request system software add $local_path no-validate" 2>&1)
+            INSTALL_STATUS=$?
+            
+            if [ $INSTALL_STATUS -eq 0 ] && ! echo "$INSTALL_OUTPUT" | grep -qi "ERROR"; then
+                log_message "NOTICE" "Firmware installed successfully"
+                if ! attempt_reboot; then
+                    log_message "ERROR" "Reboot failed after successful installation"
+                    return 1
+                fi
+                return 0
+            fi
+            log_message "WARNING" "Installation of existing file failed, will attempt download"
+        else
+            log_message "WARNING" "Existing firmware file MD5 verification failed, will attempt download"
+        fi
+    fi
+
+    # If we get here, we need to download the firmware
     while [ $retry_count -lt $MAX_RETRIES ]; do
         retry_count=$((retry_count + 1))
         log_message "INFO" "Download attempt $retry_count of $MAX_RETRIES"
 
-        # Prepare upgrade command
-        prepare_upgrade_command || {
-            log_message "ERROR" "Failed to prepare upgrade command"
+        # Download with curl using resume capability
+        log_message "COMMAND" "curl -C - -o \"$local_path\" \"http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE\""
+        if ! curl -C - -o "$local_path" "http://$REMOTE_SERVER/$FIRMWARE_PATH/$TARGET_FIRMWARE_FILE"; then
+            log_message "ERROR" "Curl download failed"
+            if [ $retry_count -lt $MAX_RETRIES ]; then
+                log_message "NOTICE" "Waiting $RETRY_DELAY seconds before next attempt"
+                sleep $RETRY_DELAY
+                continue
+            else
+                handle_error "All download attempts failed"
+                return 1
+            fi
+        fi
+
+        # Verify MD5 if needed
+        if ! verify_firmware_md5 "$local_path" "$TARGET_FIRMWARE_MD5"; then
+            log_message "ERROR" "MD5 verification failed, retrying download"
             continue
-        }
+        fi
 
-        # Start timer for installation
-        start_time=$(date +%s)
+        # Install the downloaded firmware
+        log_message "INFO" "Download successful, installing firmware"
+        INSTALL_OUTPUT=$(cli -c "request system software add $local_path no-validate" 2>&1)
+        INSTALL_STATUS=$?
 
-        # Execute upgrade with timeout
-        log_message "COMMAND" "$UPGRADE_CMD_FULL"
-        if ! INSTALL_OUTPUT=$(timeout $MAX_INSTALL_TIME cli -c "$UPGRADE_CMD_FULL" 2>&1); then
-            INSTALL_STATUS=$?
-            log_message "ERROR" "Installation attempt $retry_count failed with status: $INSTALL_STATUS"
+        if [ $INSTALL_STATUS -eq 0 ] && ! echo "$INSTALL_OUTPUT" | grep -qi "ERROR"; then
+            log_message "NOTICE" "Firmware installed successfully"
             
+            # Attempt reboot with retries
+            if ! attempt_reboot; then
+                log_message "ERROR" "Reboot failed after successful installation"
+                return 1
+            fi
+            return 0
+        else
+            log_message "ERROR" "Installation failed. Output: $INSTALL_OUTPUT"
             if [ $retry_count -lt $MAX_RETRIES ]; then
                 log_message "NOTICE" "Waiting $RETRY_DELAY seconds before next attempt"
                 sleep $RETRY_DELAY
                 continue
-            else
-                handle_error "All installation attempts failed"
-                return 1
             fi
         fi
-
-        # Check for errors in output
-        if echo "$INSTALL_OUTPUT" | grep -qi "ERROR\|Operation timed out\|Cannot fetch file"; then
-            log_message "ERROR" "Firmware installation failed with output: $INSTALL_OUTPUT"
-            
-            if [ $retry_count -lt $MAX_RETRIES ]; then
-                log_message "NOTICE" "Waiting $RETRY_DELAY seconds before next attempt"
-                sleep $RETRY_DELAY
-                continue
-            else
-                handle_error "All installation attempts failed"
-                return 1
-            fi
-        fi
-
-        # If we get here, installation was successful
-        log_message "NOTICE" "Firmware installed successfully"
-        
-        # Attempt reboot with retries
-        if ! attempt_reboot; then
-            log_message "ERROR" "Reboot failed after successful installation"
-            return 1
-        fi
-
-        return 0
     done
 
     handle_error "Exceeded maximum retry attempts"
     return 1
 }
+
+
 
 prepare_upgrade_command() {
     UPGRADE_CMD_FULL=""
@@ -722,3 +733,4 @@ else
     # Final verification
     log_message "NOTICE" "ZTP process completed successfully"
 fi
+
